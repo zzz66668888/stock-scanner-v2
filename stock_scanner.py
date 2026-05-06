@@ -237,6 +237,89 @@ def _fetch_hk_history(code, days=120):
     except:
         return None
 
+# ========== 集合竞价数据获取 ==========
+
+_AUCTION_CACHE = {}
+_AUCTION_CACHE_TIME = 0
+
+def fetch_auction_batch(codes, market='A'):
+    """批量获取集合竞价/实时行情数据（东方财富API）
+    返回 {code: {auction_price, auction_vol, buy1, sell1, limit_up, change_pct, volume, amount,
+                turnover_rate, total_value, prev_close, name}}
+    缓存60秒，避免竞价期间重复请求被限
+    """
+    global _AUCTION_CACHE, _AUCTION_CACHE_TIME
+    now = time.time()
+
+    if _AUCTION_CACHE and (now - _AUCTION_CACHE_TIME) < 60:
+        result = {}
+        for c in codes:
+            if c in _AUCTION_CACHE:
+                result[c] = _AUCTION_CACHE[c]
+        if result:
+            return result
+
+    result = {}
+    try:
+        import requests
+        s = requests.Session()
+        s.trust_env = False
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://quote.eastmoney.com/',
+        }
+
+        if market == 'A':
+            fs = 'm:0+t:6,m:0+t:13,m:1+t:2,m:1+t:23'
+        else:
+            fs = 'b:MK0204'
+
+        fields = 'f2,f3,f12,f14,f15,f16,f17,f19,f20,f43,f44,f45,f46,f47,f48,f50,f51,f52,f170,f8,f100'
+        resp = s.get('https://push2.eastmoney.com/api/qt/clist/get', params={
+            'pn': '1', 'pz': '6000', 'po': '1', 'np': '1',
+            'fltt': '2', 'invt': '2', 'fid': 'f3', 'fs': fs,
+            'fields': fields,
+        }, timeout=20, proxies={'http': None, 'https': None}, headers=headers)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data.get('data') and data['data'].get('diff'):
+                for item in data['data']['diff']:
+                    code = str(item.get('f12', ''))
+                    auction_price = item.get('f19')
+                    prev_close_val = item.get('f17') or item.get('f43', 0)
+                    result[code] = {
+                        'code': code,
+                        'name': str(item.get('f14', '')),
+                        'auction_price': float(auction_price) if auction_price and auction_price != '-' else None,
+                        'auction_vol': float(item.get('f20', 0) or 0),
+                        'buy1': float(item.get('f15', 0) or 0),
+                        'sell1': float(item.get('f16', 0) or 0),
+                        'limit_up': float(item.get('f51', 0) or 0),
+                        'limit_down': float(item.get('f52', 0) or 0),
+                        'change_pct': float(item.get('f170', 0) or 0),
+                        'volume': float(item.get('f47', 0) or 0),
+                        'amount': float(item.get('f48', 0) or 0),
+                        'turnover_rate': float(item.get('f8', 0) or 0),
+                        'total_value': float(item.get('f100', 0) or 0),
+                        'prev_close': float(prev_close_val) if prev_close_val else 0,
+                        'latest': float(item.get('f43', 0) or 0),
+                        'high': float(item.get('f44', 0) or 0),
+                        'low': float(item.get('f45', 0) or 0),
+                    }
+    except Exception as e:
+        log(f"竞价数据获取异常: {e}")
+
+    _AUCTION_CACHE = result
+    _AUCTION_CACHE_TIME = now
+
+    filtered = {}
+    for c in codes:
+        if c in result:
+            filtered[c] = result[c]
+    return filtered
+
+
 # ========== 技术指标 ==========
 
 def ema(s,n): return s.ewm(span=n,adjust=False).mean()
@@ -526,6 +609,91 @@ def detect_potential_continue_board(df, market='A'):
         return True,score,analysis
     return False,0,''
 
+def detect_call_auction(auction_data):
+    """
+    集合竞价检测：分析竞价数据，判断当日涨停概率
+    评分维度: 竞价涨幅/距涨停距离/买卖盘口比/竞价量/流通市值/价格方向
+    总分>=50判定有望涨停, >=35标记为关注
+    """
+    if not auction_data:
+        return False, 0, ''
+
+    score = 0; notes = []
+    ap = auction_data.get('auction_price')
+    prev = auction_data.get('prev_close', 0)
+    limit_up = auction_data.get('limit_up', 0)
+    buy1 = auction_data.get('buy1', 0)
+    sell1 = auction_data.get('sell1', 0)
+    total_value = auction_data.get('total_value', 0)
+    auction_vol = auction_data.get('auction_vol', 0)
+
+    if ap is None or ap <= 0:
+        ap = auction_data.get('latest', 0)
+    if ap <= 0 or prev <= 0:
+        return False, 0, '竞价数据不完整（可能不在竞价时段）'
+
+    # 1. 竞价涨幅评分
+    auction_chg = round((ap / prev - 1) * 100, 2)
+    if auction_chg >= 9.0: score += 25; notes.append(f"竞价涨幅{auction_chg:.1f}%(逼近涨停)")
+    elif auction_chg >= 7.0: score += 20; notes.append(f"竞价涨幅{auction_chg:.1f}%(强势)")
+    elif auction_chg >= 5.0: score += 15; notes.append(f"竞价涨幅{auction_chg:.1f}%")
+    elif auction_chg >= 3.0: score += 10; notes.append(f"竞价涨幅{auction_chg:.1f}%(温和)")
+    elif auction_chg >= 1.0: score += 5; notes.append(f"竞价涨幅{auction_chg:.1f}%")
+    elif auction_chg < -3.0: score -= 10; notes.append(f"竞价跌幅{auction_chg:.1f}%(弱势)")
+
+    # 2. 距涨停价距离
+    if limit_up > 0 and ap > 0:
+        distance_to_limit = round((limit_up / ap - 1) * 100, 2)
+        if distance_to_limit <= 1: score += 20; notes.append(f"距涨停仅{distance_to_limit:.1f}%(一触即发)")
+        elif distance_to_limit <= 2: score += 15; notes.append(f"距涨停{distance_to_limit:.1f}%")
+        elif distance_to_limit <= 3: score += 10; notes.append(f"距涨停{distance_to_limit:.1f}%")
+        elif distance_to_limit <= 5: score += 5; notes.append(f"距涨停{distance_to_limit:.1f}%")
+        if distance_to_limit > 5 and score > 30: score -= 5
+
+    # 3. 买卖盘口比
+    if buy1 > 0 and sell1 > 0:
+        bs_ratio = round(buy1 / sell1, 2)
+        if bs_ratio >= 3: score += 15; notes.append(f"买1/卖1={bs_ratio:.1f}(买盘压倒)")
+        elif bs_ratio >= 2: score += 12; notes.append(f"买1/卖1={bs_ratio:.1f}(买盘强势)")
+        elif bs_ratio >= 1.5: score += 8; notes.append(f"买1/卖1={bs_ratio:.1f}(买盘偏强)")
+        elif bs_ratio >= 1.0: score += 4; notes.append(f"买1/卖1={bs_ratio:.1f}(均衡)")
+        else: score -= 5; notes.append(f"买1/卖1={bs_ratio:.1f}(卖盘偏强)")
+
+    # 4. 竞价量
+    if auction_vol > 0:
+        if auction_vol >= 100000: score += 10; notes.append(f"竞价量{auction_vol/10000:.0f}万手(极度活跃)")
+        elif auction_vol >= 50000: score += 8; notes.append(f"竞价量{auction_vol/10000:.0f}万手(非常活跃)")
+        elif auction_vol >= 10000: score += 5; notes.append(f"竞价量{auction_vol/10000:.0f}万手(活跃)")
+        elif auction_vol >= 5000: score += 3; notes.append(f"竞价量{auction_vol/10000:.1f}万手")
+
+    # 5. 流通市值
+    if total_value > 0:
+        tv_yi = total_value / 100000000
+        if 20 <= tv_yi <= 200: score += 10; notes.append(f"流通市值{tv_yi:.0f}亿(适中)")
+        elif tv_yi < 20: score += 5; notes.append(f"流通市值{tv_yi:.0f}亿(小盘)")
+        elif tv_yi <= 500: score += 5; notes.append(f"流通市值{tv_yi:.0f}亿(中大盘)")
+
+    # 6. 竞价方向
+    chg_pct = auction_data.get('change_pct', 0)
+    if chg_pct > 0 and auction_chg > 0 and auction_chg > chg_pct:
+        score += 5; notes.append("竞价强度优于实时涨速")
+
+    # 7. 触及涨停
+    if limit_up > 0 and ap >= limit_up * 0.98:
+        score += 10; notes.append("竞价阶段已触及涨停价附近")
+
+    if score >= 50:
+        analysis = (f"【集合竞价强势】{'；'.join(notes)}。综合评分{score}分。"
+                    f"竞价阶段资金介入明显，{'涨停概率较大' if score >= 65 else '关注开盘后确认'}。"
+                    f"建议观察9:25最终撮合价及开盘后1分钟量能确认。")
+        return True, score, analysis
+    elif score >= 35:
+        analysis = (f"【集合竞价关注】{'；'.join(notes)}。综合评分{score}分。"
+                    f"竞价有一定强度但未达涨停确定标准，建议加入观察列表跟踪开盘走势。")
+        return True, score, analysis
+    return False, 0, ''
+
+
 def analyze_sentiment(df, stock_info=None):
     """
     情绪因子分析：从量价数据中提取市场情绪指标
@@ -618,50 +786,71 @@ def analyze_sentiment(df, stock_info=None):
 
 # ========== 分析入口 ==========
 
-def analyze_stock(stock, market='A', patterns=None):
+def analyze_stock(stock, market='A', patterns=None, auction_data=None):
     if patterns is None:
         patterns = ['bottom_divergence','uptrend','first_limit_up',
                     'consecutive_limit_up','top_divergence','bottom_launch',
                     'potential_first_board','potential_continue_board']
     h = fetch_stock_history(stock['code'], market, 60)
-    if h is None or len(h['close']) < 30: return None
-    df = pd.DataFrame({'open':h['open'],'close':h['close'],'high':h['high'],
-                       'low':h['low'],'volume':h['volume'],
-                       'turnover':h.get('turnover', [0]*len(h['close']))})
 
-    latest = h['close'][-1]; prev = h['close'][-2] if len(h['close'])>=2 else latest
-    chg = round((latest/prev-1)*100,2)
+    # 构造结果基础字段
+    latest = 0; prev = 0; chg = 0
+    if h is not None and len(h['close']) >= 30:
+        latest = h['close'][-1]; prev = h['close'][-2] if len(h['close'])>=2 else latest
+        chg = round((latest/prev-1)*100,2)
+    elif auction_data:
+        latest = auction_data.get('latest', auction_data.get('auction_price', 0)) or 0
+        prev = auction_data.get('prev_close', 0)
+        chg = auction_data.get('change_pct', 0) or round((latest/prev-1)*100,2) if latest and prev else 0
 
-    # 情绪因子分析
-    sent_score, sent_summary, sent_indicators = analyze_sentiment(df, stock)
-
-    r = {'code':stock['code'],'name':stock['name'],'price':round(latest,2),
+    r = {'code':stock['code'],'name':stock.get('name',''),'price':round(latest,2) if latest else 0,
          'change_pct':chg,'market':market,'patterns':[],
-         'sentiment':{'score':sent_score,'summary':sent_summary,'indicators':sent_indicators}}
+         'sentiment':{'score':50,'summary':'','indicators':{}}}
 
-    checks = {
-        'bottom_divergence': ('底背离','buy',detect_bottom_divergence),
-        'uptrend': ('上升趋势(左侧)','buy',detect_uptrend),
-        'first_limit_up': ('首板','buy',lambda d: detect_first_limit_up(d, market)),
-        'consecutive_limit_up': ('连板','buy',lambda d: detect_consecutive_limit_up(d, market)),
-        'top_divergence': ('顶背离','sell',detect_top_divergence),
-        'bottom_launch': ('底部即将启动','buy',detect_bottom_launch),
-        'potential_first_board': ('次日可能首板','buy',lambda d: detect_potential_first_board(d, market)),
-        'potential_continue_board': ('次日可能再板','buy',lambda d: detect_potential_continue_board(d, market)),
-    }
-    for p in patterns:
-        if p in checks:
-            name,sig,fn = checks[p]
-            ok,val,analysis = fn(df)
-            if ok:
-                dis = name
-                if p == 'consecutive_limit_up': dis = f'连板({val}连板)'; val = val*20
-                # 把情绪因子附加到分析说明末尾
-                full_analysis = analysis + ' ' + sent_summary
-                r['patterns'].append({
-                    'type':p,'name':dis,'strength':round(val,1),
-                    'signal':sig,'analysis':full_analysis
-                })
+    # K线数据有效时才做K线类形态分析
+    if h is not None and len(h['close']) >= 30:
+        df = pd.DataFrame({'open':h['open'],'close':h['close'],'high':h['high'],
+                           'low':h['low'],'volume':h['volume'],
+                           'turnover':h.get('turnover', [0]*len(h['close']))})
+
+        sent_score, sent_summary, sent_indicators = analyze_sentiment(df, stock)
+        r['sentiment'] = {'score':sent_score,'summary':sent_summary,'indicators':sent_indicators}
+
+        checks = {
+            'bottom_divergence': ('底背离','buy',detect_bottom_divergence),
+            'uptrend': ('上升趋势(左侧)','buy',detect_uptrend),
+            'first_limit_up': ('首板','buy',lambda d: detect_first_limit_up(d, market)),
+            'consecutive_limit_up': ('连板','buy',lambda d: detect_consecutive_limit_up(d, market)),
+            'top_divergence': ('顶背离','sell',detect_top_divergence),
+            'bottom_launch': ('底部即将启动','buy',detect_bottom_launch),
+            'potential_first_board': ('次日可能首板','buy',lambda d: detect_potential_first_board(d, market)),
+            'potential_continue_board': ('次日可能再板','buy',lambda d: detect_potential_continue_board(d, market)),
+        }
+        for p in patterns:
+            if p in checks:
+                name,sig,fn = checks[p]
+                ok,val,analysis = fn(df)
+                if ok:
+                    dis = name
+                    if p == 'consecutive_limit_up': dis = f'连板({val}连板)'; val = val*20
+                    full_analysis = analysis + ' ' + sent_summary
+                    r['patterns'].append({
+                        'type':p,'name':dis,'strength':round(val,1),
+                        'signal':sig,'analysis':full_analysis
+                    })
+
+    # 竞价形态独立处理（基于实时数据，不依赖历史K线）
+    if 'call_auction' in patterns and auction_data:
+        ok, score, analysis = detect_call_auction(auction_data)
+        if ok:
+            r['patterns'].append({
+                'type': 'call_auction',
+                'name': f'集合竞价({score}分)',
+                'strength': round(score, 1),
+                'signal': 'buy',
+                'analysis': analysis
+            })
+
     return r if r['patterns'] else None
 
 # ========== API路由 ==========
@@ -746,6 +935,7 @@ def api_scan():
 
     t0 = time.time()
     results = []; total_available = 0; scanned = 0
+    has_auction = patterns and 'call_auction' in patterns
 
     for market in markets:
         try:
@@ -758,12 +948,21 @@ def api_scan():
         scanned += len(batch)
         log(f"扫描: {market} offset={offset} batch={batch_size}")
 
+        # 集合竞价模式：预取实时行情数据（批量获取，避免逐只请求）
+        auction_map = {}
+        if has_auction:
+            batch_codes = [s['code'] for s in batch]
+            auction_map = fetch_auction_batch(batch_codes, market)
+            if auction_map:
+                log(f"竞价数据: 获取到{len(auction_map)}只")
+
         # 排队分析(单线程+锁保护，避免baostock并发死锁)
-    for s in batch:
-        try:
-            a = analyze_stock(s, market, patterns)
-            if a: results.append(a)
-        except: pass
+        for s in batch:
+            try:
+                ad = auction_map.get(s['code']) if auction_map else None
+                a = analyze_stock(s, market, patterns, auction_data=ad)
+                if a: results.append(a)
+            except: pass
 
     results.sort(key=lambda x: (len(x['patterns']),
                  max((p.get('strength',0) for p in x['patterns']),default=0)), reverse=True)
@@ -2059,6 +2258,8 @@ body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSyst
 .ptg:hover{border-color:var(--bl);color:var(--tx)}
 .ptg.on{border-color:var(--gn);background:rgba(63,185,80,.15);color:var(--gn)}
 .ptg.sell.on{border-color:var(--rd);color:var(--rd);background:rgba(248,81,73,.15)}
+.ptg.auction{border-color:var(--or);color:var(--or)}
+.ptg.auction.on{border-color:var(--or);color:#fff;background:rgba(210,153,29,.25);animation:pulse 2s infinite}
 .btn{background:linear-gradient(135deg,var(--bl),var(--pr));color:#fff;border:none;padding:10px 28px;border-radius:8px;font-size:.95rem;font-weight:600;cursor:pointer}
 .btn:hover{opacity:.9}.btn:disabled{opacity:.5;cursor:not-allowed}.btn.busy{background:var(--or)}
 .btns{padding:6px 14px;font-size:.8rem;border-radius:6px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);cursor:pointer}.btns:hover{border-color:var(--bl)}
@@ -2077,8 +2278,10 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 .pb{padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:500}
 .pb.buy{background:rgba(63,185,80,.15);color:var(--gn);border:1px solid rgba(63,185,80,.3)}
 .pb.sell{background:rgba(248,81,73,.15);color:var(--rd);border:1px solid rgba(248,81,73,.3)}
+.pb.auction{background:rgba(210,153,29,.2);color:var(--or);border:1px solid rgba(210,153,29,.4);animation:pulse 2s infinite}
 .analysis{font-size:.78rem;color:var(--tx2);line-height:1.5;margin-top:4px;padding:6px 10px;background:rgba(88,166,255,.05);border-radius:6px;border-left:3px solid var(--bl)}
 .analysis.sell{border-left-color:var(--rd);background:rgba(248,81,73,.05)}
+.analysis.auction{border-left-color:var(--or);background:rgba(210,153,29,.08)}
 .sent{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:600}
 .sent.hot{background:rgba(248,81,73,.15);color:var(--rd)}
 .sent.warm{background:rgba(227,179,65,.15);color:var(--yl)}
@@ -2094,7 +2297,7 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 </style>
 </head>
 <body>
-<div class="hd"><div><h1>📊 股票技术形态自动扫描系统</h1><div style="font-size:.75rem;color:var(--tx2);margin-top:2px">8种形态+情绪因子 | 换手率/量比/连阳/振幅/涨速 | A股+港股通全量扫描</div></div>
+<div class="hd"><div><h1>📊 股票技术形态自动扫描系统</h1><div style="font-size:.75rem;color:var(--tx2);margin-top:2px">9种形态+情绪因子 | 换手率/量比/连阳/振幅/涨速 | A股+港股通全量扫描 | <span id="auctionStatus" style="color:var(--or)"></span></div></div>
 <div class="st"><span><span class="sd ok" id="sd"></span> <span id="stx">就绪</span></span><span style="color:var(--tx2)" id="clk"></span></div></div>
 <div class="mc">
 <div class="cp"><div class="cr">
@@ -2111,6 +2314,7 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 <span class="ptg on" data-p="potential_continue_board" onclick="tP(this)">次日可能再板</span>
 <span class="ptg sell on" data-p="top_divergence" onclick="tP(this)">顶背离</span>
 <span class="ptg on" data-p="bottom_launch" onclick="tP(this)">底部启动</span>
+<span class="ptg auction on" data-p="call_auction" onclick="tP(this)" title="实时数据：仅在9:15-9:25竞价时段有效">⚡集合竞价</span>
 </div></div>
 <div id="errs"></div>
 <div class="sb"><div>进度: <span class="sv" id="ss">-</span></div><div>匹配: <span class="sv" id="sm">-</span></div><div>耗时: <span class="sv" id="stm">-</span></div><div class="pbar"><div class="pbar-fill" id="pfill" style="width:0%"></div></div></div>
@@ -2145,9 +2349,10 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 </div></div>
 </div>
 <script>
-let mk=['A','HK'];let pt=['bottom_divergence','uptrend','first_limit_up','consecutive_limit_up','potential_first_board','potential_continue_board','top_divergence','bottom_launch'];
+let mk=['A','HK'];let pt=['bottom_divergence','uptrend','first_limit_up','consecutive_limit_up','potential_first_board','potential_continue_board','top_divergence','bottom_launch','call_auction'];
 let timer=null;let busy=false;let polling=null;
-setInterval(()=>document.getElementById('clk').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);
+function checkAuction(){let n=new Date(),h=n.getHours(),m=n.getMinutes(),d=n.getDay(),el=document.getElementById('auctionStatus');if(d===0||d===6){el.textContent='周末休市';el.style.color='var(--tx2)';return}if(h===9&&m>=15&&m<=25){el.textContent='⚡竞价进行中 9:'+String(m).padStart(2,'0');el.style.color='var(--or)'}else if(h===9&&m>=25&&m<=30){el.textContent='竞价结束 等待开盘';el.style.color='var(--yl)'}else if((h===9&&m>=30)||(h>=10&&h<11)||(h===11&&m<=30)||(h===13&&m>=0)||(h>=14&&h<15)){el.textContent='盘中交易';el.style.color='var(--gn)'}else if((h>=0&&h<9)||(h===9&&m<15)){el.textContent='盘前';el.style.color='var(--tx2)'}else{el.textContent='已收盘';el.style.color='var(--tx2)'}}
+setInterval(()=>{document.getElementById('clk').textContent=new Date().toLocaleString('zh-CN',{hour12:false});checkAuction()},1000);
 function ss(s,t){document.getElementById('sd').className='sd '+s;document.getElementById('stx').textContent=t}
 function tM(m){let e=document.getElementById('m'+m),i=mk.indexOf(m);i>=0?(mk.splice(i,1),e.classList.remove('on')):(mk.push(m),e.classList.add('on'))}
 function tP(e){e.classList.toggle('on');let p=e.dataset.p,i=pt.indexOf(p);i>=0?pt.splice(i,1):pt.push(p)}
@@ -2234,8 +2439,8 @@ function render(rs){
     let sCls=se.score>=65?'hot':se.score>=50?'warm':se.score>=35?'neutral':'cool';
     let sEmoji=se.score>=65?'🔥':se.score>=50?'😊':se.score>=35?'😐':'😟';
     let sentHtml=`<span class="sent ${sCls}" title="${se.summary||''}">${sEmoji}${se.score||'-'}</span>`;
-    let bs=s.patterns.map(p=>`<span class="pb ${p.signal}">${p.name}(${p.strength})</span>`).join('');
-    let analyses=s.patterns.map(p=>`<div class="analysis ${p.signal}">${p.analysis||''}</div>`).join('');
+    let bs=s.patterns.map(p=>`<span class="pb ${p.signal}${p.type==='call_auction'?' auction':''}">${p.name}(${p.strength})</span>`).join('');
+    let analyses=s.patterns.map(p=>`<div class="analysis ${p.signal}${p.type==='call_auction'?' auction':''}">${p.analysis||''}</div>`).join('');
     return `<tr><td>${s.market==='A'?'A股':'港股'}</td><td style="font-family:monospace">${s.code}</td><td>${s.name}</td><td>${s.price.toFixed(2)}</td><td class="${cc}">${cs}${s.change_pct.toFixed(2)}%</td><td>${sentHtml}</td><td><div class="pbd">${bs}</div></td><td>${analyses}</td></tr>`;
   }).join('');
 }
