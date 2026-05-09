@@ -2292,6 +2292,10 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 .diag{background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:20px}
 .diag h3{margin-bottom:12px;font-size:.95rem}
 .logp{background:#000;color:#0f0;font-family:monospace;font-size:.7rem;padding:10px;border-radius:8px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
+.sort-btns{display:flex;gap:6px;align-items:center}
+.sort-btn{padding:3px 10px;border-radius:12px;font-size:.72rem;cursor:pointer;border:1px solid var(--bd);background:var(--bg);color:var(--tx2);transition:all .2s;white-space:nowrap}
+.sort-btn:hover{border-color:var(--bl);color:var(--tx)}
+.sort-btn.active{border-color:var(--bl);background:rgba(88,166,255,.15);color:var(--bl)}
 ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
 @media(max-width:768px){.hd{padding:10px 16px}.hd h1{font-size:1rem}.mc{padding:12px}.cr{flex-direction:column;align-items:stretch}}
 </style>
@@ -2318,7 +2322,7 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 </div></div>
 <div id="errs"></div>
 <div class="sb"><div>进度: <span class="sv" id="ss">-</span></div><div>匹配: <span class="sv" id="sm">-</span></div><div>耗时: <span class="sv" id="stm">-</span></div><div class="pbar"><div class="pbar-fill" id="pfill" style="width:0%"></div></div></div>
-<div class="rw"><div class="thd"><span>扫描结果（每只匹配股票附分析说明）</span><span id="rc" style="color:var(--tx2)">等待扫描...</span></div>
+<div class="rw"><div class="thd"><span>扫描结果（每只匹配股票附分析说明）</span><div class="sort-btns"><span class="sort-btn active" data-sort="strength" onclick="sortBy(this)">按强度</span><span class="sort-btn" data-sort="sentiment" onclick="sortBy(this)">🔥按情绪</span><span class="sort-btn" data-sort="patterns" onclick="sortBy(this)">按形态数</span><span id="rc" style="color:var(--tx2);margin-left:8px">等待扫描...</span></div></div>
 <div class="ts"><table><thead><tr><th style="width:50px">市场</th><th style="width:70px">代码</th><th style="width:75px">名称</th><th style="width:55px">现价</th><th style="width:55px">涨跌</th><th style="width:55px">情绪</th><th style="width:170px">形态</th><th>分析说明(含情绪)</th></tr></thead>
 <tbody id="rb"><tr><td colspan="8"><div class="emp"><p style="font-size:2.5rem">📊</p><p>点击 <b>"测试200只"</b> 快速测试 | <b>"全量扫描"</b> 扫描全部</p><p style="font-size:.8rem;color:var(--tx2)">含情绪因子: 换手率/量比/连阳/振幅/涨速</p></div></td></tr></tbody></table></div></div>
 <div id="logPanel" class="logp"></div>
@@ -2429,6 +2433,21 @@ async function scan(limit){
 
 function stopAR(){scanAborted=true;if(timer){clearInterval(timer);timer=null}document.getElementById('stb').style.display='none'}
 
+let currentSort='strength';
+function sortBy(el){
+  document.querySelectorAll('.sort-btn').forEach(b=>b.classList.remove('active'));
+  el.classList.add('active');
+  currentSort=el.dataset.sort;
+  if(!allScanResults.length)return;
+  if(currentSort==='sentiment'){
+    allScanResults.sort((a,b)=>((b.sentiment||{}).score||0)-((a.sentiment||{}).score||0));
+  }else if(currentSort==='patterns'){
+    allScanResults.sort((a,b)=>b.patterns.length-a.patterns.length);
+  }else{
+    allScanResults.sort((a,b)=>b.patterns.length-a.patterns.length||(b.patterns[0]?.strength||0)-(a.patterns[0]?.strength||0));
+  }
+  render(allScanResults);
+}
 function render(rs){
   let tb=document.getElementById('rb');
   if(!rs.length){tb.innerHTML='<tr><td colspan="8"><div class="emp"><p>未找到匹配形态</p><p style="font-size:.8rem;color:var(--tx2)">当前市场暂无满足条件的股票</p></div></td></tr>';return}
